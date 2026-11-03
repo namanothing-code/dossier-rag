@@ -18,4 +18,4 @@ dossier-rag = "dossier_rag.cli:main"
   [tool.setuptools]
   package-dir = {"dossier_rag" = "."}
   packages = ["dossier_rag"]
-packages = ["dossier_rag"]
+
