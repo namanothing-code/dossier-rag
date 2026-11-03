@@ -104,7 +104,10 @@ def cmd_ingest(a):
     if not inputs:
         return cmd_stats(a)
     inputs = _clean_upload_names(inputs, lib)
-    results, skipped = convert_all(inputs, lib / "docs")
+    # files whose exact content is already indexed are skipped (keeps hand fixes, saves time)
+    known = {r[0] for r in con.execute("SELECT sha256 FROM docs")}
+    skip = None if a.force else (lambda f: store.sha256(f) in known)
+    results, skipped = convert_all(inputs, lib / "docs", skip=skip, exclude=[lib])
     enc = None
     if a.semantic:
         enc = store.get_encoder()
@@ -165,9 +168,7 @@ def cmd_tables(a):
 
 
 def cmd_sql(a):
-    import sqlite3
-    db = (Path(a.lib) / "dossier.db").resolve()
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)  # read-only
+    con = store.connect(Path(a.lib) / "dossier.db", readonly=True)
     if not a.query.lstrip().lower().startswith(("select", "with", "pragma")):
         print("Only read-only SELECT/WITH queries are allowed.", file=sys.stderr)
         return 2
@@ -243,6 +244,7 @@ def main(argv=None):
     s = p("ingest", cmd_ingest, help="convert + index files, folders, .zip")
     s.add_argument("inputs", nargs="+")
     s.add_argument("--semantic", action="store_true", help="also compute embeddings if a model is available")
+    s.add_argument("--force", action="store_true", help="re-convert files even if unchanged (loses hand fixes)")
     s = p("search", cmd_search, help="keyword (+semantic) search with citations")
     s.add_argument("query")
     s.add_argument("-k", type=int, default=8)

@@ -59,9 +59,32 @@ TABLE_META_RE = re.compile(r"source: `([^`]+\.csv)`")
 NUM_RE = re.compile(r"^\s*([-+]?\d+(?:[.,]\d+)?)\s*([a-zA-Z]{1,6})?\s*$")
 
 
-def connect(db):
-    con = sqlite3.connect(str(db))
-    con.executescript(SCHEMA)
+def connect(db, readonly=False):
+    """Open the library. Shared/synced folders (e.g. a Windows folder mounted into a VM,
+    network drives) often don't support SQLite file locking ('disk I/O error'); then
+    fall back to no-lock mode with an in-memory journal, which is fine for one user."""
+    db = Path(db).resolve()
+    mode = "&mode=ro" if readonly else ""
+    try:
+        con = sqlite3.connect(f"file:{db}?{mode.lstrip('&')}" if readonly else str(db), uri=readonly)
+        if not readonly:
+            con.executescript(SCHEMA)
+        else:
+            con.execute("SELECT 1 FROM docs LIMIT 1")
+        return con
+    except sqlite3.OperationalError as e:
+        if "disk I/O" not in str(e) and "locked" not in str(e):
+            raise
+    for j in (db.with_name(db.name + "-journal"),):  # stale journal from the failed attempt
+        try:
+            if j.exists() and j.stat().st_size <= 512:
+                j.unlink()
+        except OSError:
+            pass
+    con = sqlite3.connect(f"file:{db}?nolock=1{mode}", uri=True)
+    if not readonly:
+        con.execute("PRAGMA journal_mode=MEMORY")
+        con.executescript(SCHEMA)
     return con
 
 

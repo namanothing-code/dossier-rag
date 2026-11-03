@@ -305,13 +305,16 @@ def safe_extract(zpath, dest):
     return dest
 
 
-def collect(inputs, outdir):
+def collect(inputs, outdir, exclude=()):
     """Expand folders and zip archives into (file, relative_output_dir) pairs."""
     jobs, skipped = [], []
 
     def walk(base, rel):
         for f in sorted(base.rglob("*")):
             if not f.is_file() or any(part.startswith((".", "__MACOSX")) for part in f.relative_to(base).parts):
+                continue
+            rf = f.resolve()
+            if any(ex == rf or ex in rf.parents for ex in exclude):  # never ingest the library itself
                 continue
             sub = rel / f.relative_to(base).parent
             ext = f.suffix.lower()
@@ -336,13 +339,16 @@ def collect(inputs, outdir):
     return jobs, skipped
 
 
-def convert_all(inputs, outdir, log=print):
+def convert_all(inputs, outdir, log=print, skip=None, exclude=()):
     """Convert files/folders/zips. Returns (results, skipped); each result is a dict
     with src, md (Path or None), notes, error."""
     outdir = Path(outdir); outdir.mkdir(parents=True, exist_ok=True)
-    jobs, skipped = collect(inputs, outdir)
+    jobs, skipped = collect(inputs, outdir, [Path(e).resolve() for e in exclude])
     results = []
     for f, sub in jobs:
+        if skip is not None and skip(f):
+            log(f"SAME {f}: already in the library, unchanged")
+            continue
         dest = outdir / sub
         dest.mkdir(parents=True, exist_ok=True)
         try:
