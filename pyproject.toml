@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dossier-rag"
+version = "0.1.0"
+description = "Convert PDFs, Word, Excel/ARM exports, folders and zips to Markdown (Camelot tables as CSV), then search them with citations (SQLite FTS5 + optional embeddings) and query trial tables with SQL."
+requires-python = ">=3.9"
+dependencies = ["camelot-py>=1.0", "pdfplumber", "pandas>=2.1", "numpy", "openpyxl", "python-docx", "tabulate"]
+
+[project.optional-dependencies]
+semantic = ["model2vec"]
+
+[project.scripts]
+dossier-rag = "dossier_rag.cli:main"
+
+[tool.setuptools]
+packages = ["dossier_rag"]
