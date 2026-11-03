@@ -50,6 +50,15 @@ def header_promote(df):
     return df
 
 
+CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f]")
+
+
+def mark_ctrl(text):
+    """Some pdftotext versions emit an undecodable glyph (often ±, ≤, ≥) as an invisible
+    control character. Make it visible as (cid:?) so it is flagged, never silently lost."""
+    return CTRL_RE.sub("(cid:?)", text.replace("\x0c", ""))
+
+
 def page_texts(path, npages):
     """Column-aware text via poppler's pdftotext; pdfplumber as fallback."""
     if shutil.which("pdftotext"):
@@ -57,7 +66,7 @@ def page_texts(path, npages):
         for i in range(1, npages + 1):
             r = subprocess.run(["pdftotext", "-f", str(i), "-l", str(i), str(path), "-"],
                                capture_output=True, text=True)
-            out.append(r.stdout)
+            out.append(mark_ctrl(r.stdout))
         return out
     import pdfplumber
     with pdfplumber.open(path) as pdf:
@@ -111,6 +120,111 @@ def caption_areas(path):
     return areas
 
 
+def undecoded_glyphs(path):
+    """{page: [(marker, x0, top, context)]} for glyphs pdfplumber reports as (cid:N)
+    or as control characters. context = up to 10 non-space chars before it on its line."""
+    import pdfplumber
+    found = {}
+    with pdfplumber.open(path) as pdf:
+        for pn, p in enumerate(pdf.pages, 1):
+            chars = p.chars
+            for i, c in enumerate(chars):
+                t = c["text"] or ""
+                if not (t.startswith("(cid:") or CTRL_RE.match(t)):
+                    continue
+                marker = t if t.startswith("(cid:") else "(cid:?)"
+                ctx = ""
+                for prev in reversed(chars[max(0, i - 40):i]):
+                    if abs(prev["top"] - c["top"]) > 3:
+                        break
+                    ctx = (prev["text"] or "") + ctx
+                ctx = re.sub(r"\s+", "", ctx)[-10:]
+                found.setdefault(pn, []).append(
+                    (marker, c["x0"], c["top"], ctx, c.get("fontname", ""), t, c))
+    return found
+
+
+def identify_glyphs(path, found, notes):
+    """Identify undecodable glyphs by shape (glyphs.py). Adds 'symbol' to each record:
+    returns {page: [(marker, x0, top, ctx, symbol or None)]}."""
+    from . import glyphs as G
+    groups = {}
+    for pn, recs in found.items():
+        for r in recs:
+            groups.setdefault((r[4], r[5]), []).append((pn, r[6]))
+    try:
+        ident = G.identify(path, groups) if groups else {}
+    except Exception as e:  # never let identification break conversion
+        notes.append(f"Symbol identification skipped: {e}")
+        ident = {}
+    out, done = {}, []
+    for pn, recs in found.items():
+        for r in recs:
+            sym = (ident.get((r[4], r[5])) or (None,))[0]
+            out.setdefault(pn, []).append((r[0], r[1], r[2], r[3], sym))
+    for (font, raw), (sym, score, _) in ident.items():
+        if sym:
+            n = len(groups[(font, raw)])
+            done.append(f"{raw}→{sym} ×{n} (score {score:.2f})")
+    if done:
+        notes.append("Undecodable symbols identified from their shape: " + ", ".join(done)
+                     + ". Shape matching is reliable but confirm against the PDF for critical values.")
+    return out
+
+
+MARK_RE = r"\(cid:[^)]*\)"
+
+
+def put_symbols(text, recs):
+    """Replace (cid:..) markers with identified symbols, using the text just before
+    each glyph to find the right marker."""
+    for marker, _, _, ctx, sym in recs:
+        if not sym:
+            continue
+        if ctx:
+            pat = r"\s*".join(re.escape(ch) for ch in ctx) + r"(\s*)" + MARK_RE
+            new, k = re.subn(pat, lambda m: m.group(0)[: m.start(1) - m.start(0)] + m.group(1) + sym,
+                             text, count=1)
+            if k:
+                text = new
+                continue
+        if marker != "(cid:?)":  # no usable context: replace the exact marker once
+            text = text.replace(marker, sym, 1)
+    return text
+
+
+def restore_dropped(df, glyphs, notes, label):
+    """Camelot 2.x drops undecodable glyphs from table cells. Put a (cid:N) marker back
+    right after its context; if the context can't be found, flag the whole table."""
+    if not glyphs:
+        return df
+    lost = 0
+    for marker, _, _, ctx, *_ in glyphs:
+        placed = False
+        for r in range(df.shape[0]):
+            for c in range(df.shape[1]):
+                cell = str(df.iat[r, c])
+                if "(cid:" in cell:
+                    continue
+                idx, flat = [], []
+                for k, ch in enumerate(cell):
+                    if not ch.isspace():
+                        idx.append(k); flat.append(ch)
+                pos = "".join(flat).find(ctx) if ctx else -1
+                if pos != -1:
+                    k = idx[pos + len(ctx) - 1] + 1
+                    df.iat[r, c] = cell[:k] + " " + marker + cell[k:].lstrip()
+                    placed = True
+                    break
+            if placed:
+                break
+        lost += not placed
+    if lost:
+        notes.append(f"{label}: {lost} undecodable symbol(s) were dropped by the table reader and "
+                     f"could not be placed; compare the table with the PDF.")
+    return df
+
+
 def merge_wrapped(df):
     """Stream mode makes one row per text line. A row whose first cell is empty
     is a wrapped continuation of the row above, so join it upward."""
@@ -150,9 +264,29 @@ def convert_pdf(path, out_md, tdir, notes):
     tables_by_page = {}
     n = 0
 
+    glyphs = identify_glyphs(path, undecoded_glyphs(path), notes)
+    pages = [put_symbols(t, glyphs.get(i, [])) for i, t in enumerate(pages, 1)]
+
     def add(t, flavor, caption=""):
         nonlocal n
         n += 1
+        raw = t.df.copy()
+        if not raw.astype(str).apply(lambda col: col.str.contains("(cid:", regex=False)).any().any():
+            pg = int(t.page)
+            ph = None
+            try:
+                x1, y1, x2, y2 = t._bbox  # PDF points, origin bottom-left
+                import pdfplumber
+                with pdfplumber.open(path) as pdf:
+                    ph = pdf.pages[pg - 1].height
+                inside = [g for g in glyphs.get(pg, [])
+                          if x1 - 2 <= g[1] <= x2 + 2 and ph - y2 - 2 <= g[2] <= ph - y1 + 2]
+            except Exception:
+                inside = glyphs.get(pg, [])
+            raw = restore_dropped(raw, inside, notes, caption or f"table {n} (page {pg})")
+        pg_recs = glyphs.get(int(t.page), [])
+        raw = raw.map(lambda v: put_symbols(v, pg_recs) if isinstance(v, str) and "(cid:" in v else v)
+        t.df = raw
         df = header_promote(t.df.copy())
         csv = save_table(df, tdir, n)
         acc = t.parsing_report.get("accuracy", 0)
@@ -187,7 +321,7 @@ def convert_pdf(path, out_md, tdir, notes):
                     add(t, "stream", caption)
     if any("(cid:" in t for t in pages) or any(
             "(cid:" in df.to_string() for v in tables_by_page.values() for (_, _, _, _, df, _) in v):
-        notes.append("Some symbols could not be decoded and appear as (cid:N), often ± or ≤/≥; "
+        notes.append("Some symbols could not be decoded or identified and appear as (cid:N); "
                      "check them against the PDF and replace them.")
     if not tables_by_page and any(re.search(r"\bTable\s*\d", t) for t in pages):
         notes.append("Text mentions tables but none could be extracted; check the PDF manually.")
