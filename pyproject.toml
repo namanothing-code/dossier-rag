@@ -15,5 +15,7 @@ semantic = ["model2vec"]
 [project.scripts]
 dossier-rag = "dossier_rag.cli:main"
 
-[tool.setuptools]
+  [tool.setuptools]
+  package-dir = {"dossier_rag" = "."}
+  packages = ["dossier_rag"]
 packages = ["dossier_rag"]
