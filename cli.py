@@ -11,7 +11,7 @@
   dossier-rag pack    --lib library --out library.zip
   dossier-rag restore library.zip --lib library
 """
-import argparse, json, sys
+import argparse, json, re, sys
 from pathlib import Path
 
 from . import store
@@ -63,10 +63,30 @@ def cmd_pack(a):
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for f in sorted(lib.rglob("*")):
             rel = f.relative_to(lib)
-            if f.is_file() and "_extracted" not in rel.parts:
+            if f.is_file() and not {"_extracted", "_uploads"} & set(rel.parts):
                 z.write(f, Path("library") / rel)
     print(f"Packed {lib} -> {out} ({out.stat().st_size // 1024} KB). Upload this zip in a new chat to continue.")
     return 0
+
+
+UPLOAD_PREFIX = re.compile(r"^[0-9a-f]{8}-\d{6,}_")  # chat uploads: '<id>-<timestamp>_name.pdf'
+
+
+def _clean_upload_names(inputs, lib):
+    """Copy chat uploads to their clean names so citations read 'PP1_307_2_en-...pdf'."""
+    import shutil
+    out = []
+    stage = Path(lib) / "_uploads"
+    for i in inputs:
+        p = Path(i)
+        if p.is_file() and UPLOAD_PREFIX.match(p.name):
+            stage.mkdir(parents=True, exist_ok=True)
+            q = stage / UPLOAD_PREFIX.sub("", p.name)
+            shutil.copy2(p, q)
+            out.append(str(q))
+        else:
+            out.append(i)
+    return out
 
 
 def cmd_ingest(a):
@@ -83,6 +103,7 @@ def cmd_ingest(a):
     con, lib = _con(a.lib)
     if not inputs:
         return cmd_stats(a)
+    inputs = _clean_upload_names(inputs, lib)
     results, skipped = convert_all(inputs, lib / "docs")
     enc = None
     if a.semantic:
@@ -154,7 +175,9 @@ def cmd_sql(a):
     cols = [d[0] for d in cur.description]
     rows = cur.fetchall()
     import pandas as pd
-    print(pd.DataFrame(rows, columns=cols).to_markdown(index=False, disable_numparse=True) if rows else "(no rows)")
+    df = pd.DataFrame(rows, columns=cols).map(
+        lambda x: re.sub(r"\s*\n\s*", " ", x) if isinstance(x, str) else x)  # one line per row
+    print(df.to_markdown(index=False, disable_numparse=True) if rows else "(no rows)")
     return 0
 
 
